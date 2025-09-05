@@ -1,21 +1,17 @@
 name: Deploy to Kubernetes
 
 on:
-  workflow_call:
+  workflow_dispatch:
     inputs:
       environment:
-        type: string
+        description: 'Environment to deploy to'
         required: true
-        description: "Environment to deploy to (development, staging)"
-      kubeconfig:
-        type: string
-        required: false
-        description: "Kubeconfig for real cluster (optional)"
-    secrets:
-      DOCKERHUB_USERNAME:
-        required: true
-      DOCKERHUB_PASSWORD:
-        required: true
+        default: 'development'
+        type: choice
+        options:
+          - development
+          - staging
+          - production
 
 env:
   HELM_VERSION: '3.12.0'
@@ -23,54 +19,53 @@ env:
   DOCKER_IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/devops-todolist
 
 jobs:
-  deploy:
-    name: Deploy to ${{ inputs.environment }}
+  prepare:
+    name: Prepare repository
     runs-on: ubuntu-latest
 
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
-
-    - name: Set up Helm
-      uses: azure/setup-helm@v3
       with:
-        version: ${{ env.HELM_VERSION }}
+        fetch-depth: 0
 
-    - name: Set up Kind cluster
-      if: inputs.kubeconfig == ''
+    - name: Upload repository content
+      uses: actions/upload-artifact@v4
+      with:
+        name: repository-content
+        path: .
+        retention-days: 5
+
+  docker-ci:
+    name: Docker CI
+    runs-on: ubuntu-latest
+    needs: prepare
+
+    steps:
+    - name: Download repository content
+      uses: actions/download-artifact@v4
+      with:
+        name: repository-content
+        path: .
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+
+    - name: Install dependencies
       run: |
-        echo "🚀 Setting up Kind cluster for ${{ inputs.environment }}"
-        curl -Lo ./kind https://kind.sigs.k8s.io/dl/${{ env.KIND_VERSION }}/kind-linux-amd64
-        chmod +x ./kind
-        sudo mv ./kind /usr/local/bin/kind
+        python -m pip install --upgrade pip
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        pip install coverage flake8
 
-        # Create Kind cluster configuration
-        cat > cluster.yml << EOF
-        kind: Cluster
-        apiVersion: kind.x-k8s.io/v1alpha4
-        nodes:
-        - role: control-plane
-          extraPortMappings:
-          - containerPort: 30000
-            hostPort: 8000
-            protocol: TCP
-        EOF
-
-        kind create cluster --name ${{ inputs.environment }} --config cluster.yml
-        kind export kubeconfig --name ${{ inputs.environment }}
-
-    - name: Set up existing cluster
-      if: inputs.kubeconfig != ''
+    - name: Run tests with coverage
       run: |
-        echo "🔗 Using existing cluster configuration"
-        mkdir -p ~/.kube
-        echo "${{ inputs.kubeconfig }}" > ~/.kube/config
-
-    - name: Verify cluster access
-      run: |
-        echo "🔍 Verifying cluster access..."
-        kubectl cluster-info
-        kubectl get nodes
+        if [ -d "tests" ]; then
+          coverage run -m pytest tests/ -v
+        else
+          echo "No tests found, skipping test execution"
+        fi
 
     - name: Login to DockerHub
       uses: docker/login-action@v3
@@ -78,61 +73,98 @@ jobs:
         username: ${{ secrets.DOCKERHUB_USERNAME }}
         password: ${{ secrets.DOCKERHUB_PASSWORD }}
 
-    - name: Download Helm chart artifact
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./Dockerfile
+        push: true
+        tags: |
+          ${{ env.DOCKER_IMAGE_NAME }}:${{ github.sha }}
+          ${{ env.DOCKER_IMAGE_NAME }}:latest
+
+    - name: Upload image metadata
+      uses: actions/upload-artifact@v4
+      with:
+        name: image-metadata
+        path: |
+          Dockerfile
+          requirements.txt
+        retention-days: 5
+
+  deploy-to-kind:
+    name: Deploy to Kind - ${{ github.event.inputs.environment }}
+    runs-on: ubuntu-latest
+    needs: [prepare, docker-ci]
+    environment: ${{ github.event.inputs.environment }}
+
+    steps:
+    - name: Download repository content
       uses: actions/download-artifact@v4
       with:
-        name: helm-chart-package
+        name: repository-content
         path: .
+
+    - name: Set up Helm
+      uses: azure/setup-helm@v3
+      with:
+        version: ${{ env.HELM_VERSION }}
+
+    - name: Set up Kind
+      run: |
+        curl -Lo ./kind https://kind.sigs.k8s.io/dl/${{ env.KIND_VERSION }}/kind-linux-amd64
+        chmod +x ./kind
+        sudo mv ./kind /usr/local/bin/kind
+
+    - name: Create Kind cluster
+      run: |
+        if [ -f "cluster.yml" ]; then
+          kind create cluster --config cluster.yml --name ${{ github.event.inputs.environment }}
+        else
+          kind create cluster --name ${{ github.event.inputs.environment }}
+        fi
+        kubectl cluster-info --context kind-${{ github.event.inputs.environment }}
 
     - name: Helm dry-run
       run: |
-        echo "🔍 Running helm dry-run..."
-        CHART_FILE=$(ls *.tgz 2>/dev/null | head -n 1)
-        if [ -n "$CHART_FILE" ]; then
-          helm upgrade --install devops-todolist $CHART_FILE \
-            --namespace ${{ inputs.environment }} \
+        if [ -f "chart/Chart.yaml" ]; then
+          helm upgrade --install devops-todolist chart/ \
+            --namespace ${{ github.event.inputs.environment }} \
             --create-namespace \
             --set image.repository=${{ env.DOCKER_IMAGE_NAME }} \
             --set image.tag=${{ github.sha }} \
-            --set environment=${{ inputs.environment }} \
             --dry-run \
             --debug
         else
-          echo "No Helm chart package found"
-          exit 1
+          echo "No Helm chart found for dry-run"
         fi
 
     - name: Helm upgrade --install (atomic)
       run: |
-        echo "🚀 Deploying to ${{ inputs.environment }}..."
-        CHART_FILE=$(ls *.tgz 2>/dev/null | head -n 1)
-        if [ -n "$CHART_FILE" ]; then
-          helm upgrade --install devops-todolist $CHART_FILE \
-            --namespace ${{ inputs.environment }} \
+        if [ -f "chart/Chart.yaml" ]; then
+          helm upgrade --install devops-todolist chart/ \
+            --namespace ${{ github.event.inputs.environment }} \
             --create-namespace \
             --set image.repository=${{ env.DOCKER_IMAGE_NAME }} \
             --set image.tag=${{ github.sha }} \
-            --set environment=${{ inputs.environment }} \
             --atomic \
             --timeout 5m \
             --wait
         else
-          echo "No Helm chart package found"
+          echo "No Helm chart found for deployment"
           exit 1
         fi
 
     - name: Verify deployment
       run: |
-        echo "✅ Verifying deployment in ${{ inputs.environment }}..."
-        kubectl get pods -n ${{ inputs.environment }}
-        kubectl get svc -n ${{ inputs.environment }}
-        kubectl get deployments -n ${{ inputs.environment }}
+        kubectl get pods -n ${{ github.event.inputs.environment }}
+        kubectl get svc -n ${{ github.event.inputs.environment }}
+        echo "✅ Successfully deployed to ${{ github.event.inputs.environment }} environment"
 
-    - name: Display deployment info
-      run: |
-        echo "🎉 Successfully deployed to ${{ inputs.environment }}!"
-        echo "🐳 Image: ${{ env.DOCKER_IMAGE_NAME }}:${{ github.sha }}"
-        echo "🏷️ Environment: ${{ inputs.environment }}"
-        if [ "${{ inputs.environment }}" = "development" ] && [ "${{ inputs.kubeconfig }}" = "" ]; then
-          echo "🌐 Local development URL: http://localhost:8000"
-        fi
+    - name: Upload deployment info
+      uses: actions/upload-artifact@v4
+      with:
+        name: deployment-info-${{ github.event.inputs.environment }}
+        path: |
+          chart/
+        retention-days: 5

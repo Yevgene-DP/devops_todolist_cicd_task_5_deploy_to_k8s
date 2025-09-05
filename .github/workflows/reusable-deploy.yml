@@ -1,0 +1,68 @@
+name: Reusable Deploy to Kubernetes
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      image-tag:
+        required: true
+        type: string
+
+env:
+  HELM_VERSION: '3.12.0'
+  DOCKER_IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/devops-todolist
+
+jobs:
+  deploy:
+    name: Deploy to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Helm
+      uses: azure/setup-helm@v3
+      with:
+        version: ${{ env.HELM_VERSION }}
+
+    - name: Set up Kind
+      run: |
+        curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
+        chmod +x ./kind
+        sudo mv ./kind /usr/local/bin/kind
+
+    - name: Create Kind cluster
+      run: |
+        kind create cluster --name ${{ inputs.environment }}
+        kubectl cluster-info --context kind-${{ inputs.environment }}
+
+    - name: Helm dry-run
+      run: |
+        helm upgrade --install devops-todolist chart/ \
+          --namespace ${{ inputs.environment }} \
+          --create-namespace \
+          --set image.repository=${{ env.DOCKER_IMAGE_NAME }} \
+          --set image.tag=${{ inputs.image-tag }} \
+          --dry-run \
+          --debug
+
+    - name: Helm upgrade --install (atomic)
+      run: |
+        helm upgrade --install devops-todolist chart/ \
+          --namespace ${{ inputs.environment }} \
+          --create-namespace \
+          --set image.repository=${{ env.DOCKER_IMAGE_NAME }} \
+          --set image.tag=${{ inputs.image-tag }} \
+          --atomic \
+          --timeout 5m \
+          --wait
+
+    - name: Verify deployment
+      run: |
+        kubectl get pods -n ${{ inputs.environment }}
+        kubectl get svc -n ${{ inputs.environment }}
+        echo "Successfully deployed to ${{ inputs.environment }} environment"
